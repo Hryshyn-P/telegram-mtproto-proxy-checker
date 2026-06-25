@@ -183,13 +183,13 @@ async function verifyProxy(server, port, hexSecret) {
   }
   
   // Create TDLib instance - it should find the DLL via tdl.configure()
-  const tdlib = new TDLib();
+  const tdlib = new TDLib(tdlibPath || undefined);
   const client = new Client(tdlib, {
     apiId: 12345,
     apiHash: '0123456789abcdef0123456789abcdef',
     useTestDc: false,
-    databaseDirectory: './tdlib-db',
-    filesDirectory: './tdlib-files',
+    databaseDirectory: '/tmp/tdlib-db',
+    filesDirectory: '/tmp/tdlib-files',
   });
 
   try {
