@@ -1,35 +1,53 @@
 #!/usr/bin/env node
-import { execFile } from 'child_process';
-import { promisify } from 'util';
+/**
+ * batch-check.mjs — быстрая параллельная проверка MTProto прокси через один TDLib клиент
+ */
 import { createReadStream, writeFileSync, existsSync, readFileSync } from 'fs';
 import { createInterface } from 'readline';
 import https from 'https';
 import http from 'http';
 import { fileURLToPath } from 'url';
-import { dirname, resolve } from 'path';
+import { dirname, resolve, join } from 'path';
+import { createRequire } from 'module';
 
-const execFileAsync = promisify(execFile);
+const require = createRequire(import.meta.url);
 const __dir = dirname(fileURLToPath(import.meta.url));
-const CHECKER = resolve(__dir, 'index.js');
 
 // --- Args ---
 const positional = process.argv.slice(2).filter(a => !a.startsWith('--'));
 const flags = Object.fromEntries(
-  process.argv.slice(2)
-    .filter(a => a.startsWith('--'))
-    .map(a => a.slice(2).split('='))
+  process.argv.slice(2).filter(a => a.startsWith('--')).map(a => a.slice(2).split('='))
 );
 
 const [inputArg, outputArg] = positional;
-const CONCURRENCY = parseInt(flags.concurrency ?? '15');
-const TIMEOUT_MS  = parseInt(flags.timeout ?? '30000');
+const CONCURRENCY = parseInt(flags.concurrency ?? '40');
+const TIMEOUT_MS  = parseInt(flags.timeout ?? '15000');
 
 if (!inputArg) {
-  console.error('Usage: node batch-check.mjs <input-file|url|-> [output-file] [--concurrency=15] [--timeout=30000]');
+  console.error('Usage: node batch-check.mjs <input-file|url|-> [output-file] [--concurrency=40] [--timeout=15000]');
   process.exit(1);
 }
 
-// --- Read lines from file/url/stdin ---
+// --- Парсим прокси-ссылку ---
+function parseProxy(raw) {
+  try {
+    const url = new URL(raw.replace(/^tg:\/\/proxy/, 'https://proxy').replace(/^https:\/\/t\.me\/proxy/, 'https://proxy'));
+    const server = url.searchParams.get('server');
+    const port   = parseInt(url.searchParams.get('port'));
+    const secret = url.searchParams.get('secret');
+    if (!server || !port || !secret) return null;
+
+    // конвертируем secret в hex если base64
+    let hexSecret = secret;
+    if (!/^[0-9a-fA-F]+$/.test(secret)) {
+      // base64 → hex
+      hexSecret = Buffer.from(secret, 'base64').toString('hex');
+    }
+    return { raw, server, port, hexSecret };
+  } catch { return null; }
+}
+
+// --- Читаем строки ---
 async function readLines(src) {
   if (src === '-') {
     const rl = createInterface({ input: process.stdin, terminal: false });
@@ -56,39 +74,78 @@ async function readLines(src) {
   return lines;
 }
 
-// --- Check one proxy ---
-async function checkProxy(proxy) {
-  const start = Date.now();
-  try {
-    const { stdout } = await execFileAsync('node', [CHECKER, proxy], { timeout: TIMEOUT_MS });
-    if (stdout.trim() === 'OK') return { proxy, ms: Date.now() - start, ok: true };
-  } catch {}
-  return { proxy, ok: false };
+// --- TDLib клиент ---
+function createTdlClient() {
+  const { getTdjson } = require('prebuilt-tdlib');
+  const tdl = require('tdl');
+  tdl.configure({ tdjson: getTdjson(), verbosityLevel: 0 });
+  const client = tdl.createClient({
+    apiId: 12345,
+    apiHash: '0123456789abcdef0123456789abcdef',
+    databaseDirectory: '/tmp/tdlib-batch',
+    filesDirectory: '/tmp/tdlib-batch-files',
+  });
+  client.on('error', () => {});
+  return client;
 }
 
-// --- Concurrency pool ---
-async function pool(items, fn, concurrency, label) {
-  const results = [];
-  let i = 0, done = 0;
-  const total = items.length;
-  async function worker() {
-    while (i < items.length) {
-      const item = items[i++];
-      const r = await fn(item);
-      results.push(r);
-      done++;
-      const suffix = r.ok ? `  ✓ ${r.ms}ms ${r.proxy}` : '';
-      process.stderr.write(`\r  [${label}] ${done}/${total}${suffix.padEnd(60)}`);
+// --- Проверяем батч прокси через один клиент ---
+async function checkAll(proxies, client) {
+  const results = new Map(); // raw -> { ok, ms }
+  let done = 0;
+  const total = proxies.length;
+
+  // Семафор для ограничения параллельных invoke
+  let active = 0;
+  const queue = [];
+  function schedule(fn) {
+    return new Promise((res, rej) => {
+      queue.push({ fn, res, rej });
+      drain();
+    });
+  }
+  function drain() {
+    while (active < CONCURRENCY && queue.length > 0) {
+      const { fn, res, rej } = queue.shift();
+      active++;
+      fn().then(r => { active--; res(r); drain(); }).catch(e => { active--; rej(e); drain(); });
     }
   }
-  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+
+  await Promise.all(proxies.map(p => schedule(async () => {
+    const start = Date.now();
+    try {
+      const added = await client.invoke({
+        _: 'addProxy',
+        server: p.server,
+        port: p.port,
+        enable: false,
+        type: { _: 'proxyTypeMtproto', secret: p.hexSecret }
+      });
+
+      const ping = await Promise.race([
+        client.invoke({ _: 'pingProxy', proxy_id: added.id }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), TIMEOUT_MS))
+      ]);
+
+      const ms = Math.round((ping.seconds ?? 0) * 1000) || (Date.now() - start);
+      results.set(p.raw, { ok: true, ms });
+      process.stderr.write(`  ✓ ${ms}ms ${p.server}\n`);
+    } catch {
+      results.set(p.raw, { ok: false });
+    }
+
+    done++;
+    process.stderr.write(`\r  [${done}/${total}]`.padEnd(20));
+  })));
+
   process.stderr.write('\n');
   return results;
 }
 
 // --- Main ---
 
-// 1. Читаем существующий output файл
+// 1. Читаем существующий output
 let existing = new Set();
 if (outputArg && existsSync(outputArg)) {
   const saved = readFileSync(outputArg, 'utf8').split('\n').map(l => l.trim()).filter(Boolean);
@@ -98,64 +155,51 @@ if (outputArg && existsSync(outputArg)) {
 
 // 2. Загружаем новый список
 const incoming = await readLines(inputArg);
-process.stderr.write(`Новый список: ${incoming.length} прокси\n\n`);
+process.stderr.write(`Новый список: ${incoming.length} прокси\n`);
 
-// 3. Перепроверяем существующие (которых нет в новом списке — могли протухнуть)
+// 3. Объединяем всё что нужно проверить (новые + существующие которых нет в новом)
 const incomingSet = new Set(incoming);
-const toRecheck = [...existing].filter(p => !incomingSet.has(p));
+const onlyInExisting = [...existing].filter(p => !incomingSet.has(p));
+const allToCheck = [...incoming, ...onlyInExisting];
 
-let stillAlive = new Set();
-if (toRecheck.length > 0) {
-  process.stderr.write(`Перепроверка существующих (не в новом списке): ${toRecheck.length}\n`);
-  const recheckResults = await pool(toRecheck, checkProxy, CONCURRENCY, 'recheck');
-  for (const r of recheckResults) {
-    if (r.ok) stillAlive.add(r.proxy);
-  }
-  const dead = toRecheck.length - stillAlive.size;
-  process.stderr.write(`  живые: ${stillAlive.size}, протухли: ${dead}\n\n`);
-}
+process.stderr.write(`Всего к проверке: ${allToCheck.length} (новых: ${incoming.length}, только в файле: ${onlyInExisting.length})\n\n`);
 
-// Существующие которые есть и в новом списке — проверим вместе с новыми
-// чтобы обновить время отклика; не добавляем их отдельно
+// 4. Парсим
+const parsed = allToCheck.map(parseProxy).filter(Boolean);
+const skipped = allToCheck.length - parsed.length;
+if (skipped > 0) process.stderr.write(`Пропущено (не распарсились): ${skipped}\n`);
 
-// 4. Из нового списка фильтруем только те которых ещё нет среди живых
-const toCheck = incoming.filter(p => !stillAlive.has(p));
-process.stderr.write(`Проверка новых/обновлённых: ${toCheck.length}\n`);
-const newResults = await pool(toCheck, checkProxy, CONCURRENCY, 'check');
+// 5. Создаём клиент и подключаемся
+process.stderr.write(`Подключаюсь к TDLib...\n`);
+const client = createTdlClient();
+await client.connect();
+process.stderr.write(`Подключено. Проверяю (параллельность: ${CONCURRENCY}, таймаут: ${TIMEOUT_MS}ms)...\n\n`);
 
-// 5. Объединяем: живые из recheck (без времени) + живые из нового списка (с временем)
-const freshAlive = newResults.filter(r => r.ok);
+// 6. Проверяем
+const results = await checkAll(parsed, client);
+client.close();
 
-// Для stillAlive у нас нет нового времени — ставим Infinity чтобы шли в конец
-const merged = [
-  ...freshAlive,
-  ...[...stillAlive].map(proxy => ({ proxy, ms: Infinity, ok: true }))
-].sort((a, b) => a.ms - b.ms);
+// 7. Фильтруем и сортируем
+const alive = parsed
+  .map(p => ({ ...p, ...results.get(p.raw) }))
+  .filter(p => p.ok)
+  .sort((a, b) => a.ms - b.ms);
 
-// Убираем дубли (на случай пересечений)
-const seen = new Set();
-const deduped = merged.filter(r => {
-  if (seen.has(r.proxy)) return false;
-  seen.add(r.proxy);
-  return true;
-});
+process.stderr.write(`\n`);
 
-process.stderr.write('\n');
-
-if (deduped.length === 0) {
+if (alive.length === 0) {
   process.stderr.write('Живых прокси не найдено.\n');
   if (outputArg) writeFileSync(outputArg, '');
   process.exit(0);
 }
 
-const output = deduped.map(r => r.proxy).join('\n') + '\n';
+const output = alive.map(p => p.raw).join('\n') + '\n';
 
 if (outputArg) {
   writeFileSync(outputArg, output);
-  process.stderr.write(`Сохранено ${deduped.length} живых → ${outputArg}\n`);
+  process.stderr.write(`Сохранено ${alive.length} живых → ${outputArg}\n`);
 } else {
   process.stdout.write(output);
 }
 
-const totalChecked = toRecheck.length + toCheck.length;
-process.stderr.write(`Итого: ${deduped.length} живых | проверено: ${totalChecked} | новых источников: ${incoming.length}\n`);
+process.stderr.write(`Итого: ${alive.length} живых из ${allToCheck.length}\n`);
